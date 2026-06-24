@@ -1,0 +1,24 @@
+.DS_Store
+
+# Compilación
+*.o
+*.out
+*.exe
+*.class
+bin/
+obj/
+
+
+# Logs
+*.log
+
+#especial
+.env
+.vscode/
+.idea/
+background.sh
+Dockerfile
+/build
+
+# Runtime logs and pid
+logs/
