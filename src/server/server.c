@@ -1,4 +1,5 @@
 #include "include/server.h"
+#include "include/socks5.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -14,14 +15,6 @@
 #include <sys/types.h>
 
 #include "../utils/include/selector.h"
-
-#define SOCKS_VERSION 0x05
-#define SOCKS_METHOD_NO_AUTH 0x00
-#define SOCKS_METHOD_NO_ACCEPTABLE 0xFF
-#define SOCKS_CMD_CONNECT 0x01
-#define SOCKS_ATYP_IPV4 0x01
-#define SOCKS_REPLY_SUCCESS 0x00
-#define SOCKS_REPLY_GENERAL_FAILURE 0x01
 
 static volatile sig_atomic_t done = 0;
 
@@ -247,38 +240,22 @@ static void client_write(struct selector_key *key) {
     update_relay_interests(key->s, state);
 }
 
-static bool client_offers_no_auth(const uint8_t *methods, size_t nmethods) {
-    for (size_t i = 0; i < nmethods; i++) {
-        if (methods[i] == SOCKS_METHOD_NO_AUTH) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static void prepare_greeting_response(client_state_t *state, uint8_t method) {
-    state->write_buffer[0] = SOCKS_VERSION;
-    state->write_buffer[1] = method;
-    state->write_len = 2;
-    state->write_off = 0;
+    socks5_prepare_greeting_response(
+        state->write_buffer,
+        &state->write_len,
+        &state->write_off,
+        method
+    );
 }
 
 static void prepare_request_response(client_state_t *state, uint8_t reply) {
-    state->write_buffer[0] = SOCKS_VERSION;
-    state->write_buffer[1] = reply;
-    state->write_buffer[2] = 0x00;
-    state->write_buffer[3] = SOCKS_ATYP_IPV4;
-
-    state->write_buffer[4] = 0x00;
-    state->write_buffer[5] = 0x00;
-    state->write_buffer[6] = 0x00;
-    state->write_buffer[7] = 0x00;
-
-    state->write_buffer[8] = 0x00;
-    state->write_buffer[9] = 0x00;
-
-    state->write_len = 10;
-    state->write_off = 0;
+    socks5_prepare_request_response(
+        state->write_buffer,
+        &state->write_len,
+        &state->write_off,
+        reply
+    );
 }
 
 static bool connect_to_target(client_state_t *state) {
@@ -437,21 +414,21 @@ static void client_read(struct selector_key *key) {
             uint8_t version = state->read_buffer[0];
             uint8_t nmethods = state->read_buffer[1];
 
-            if (version != SOCKS_VERSION || state->read_len < 2 + nmethods) {
+            if (version != SOCKS5_VERSION || state->read_len < 2 + nmethods) {
                 selector_unregister_fd(key->s, key->fd);
                 return;
             }
 
-            bool accepts_no_auth = client_offers_no_auth(
+            bool accepts_no_auth = socks5_client_offers_no_auth(
                 state->read_buffer + 2,
                 nmethods
             );
 
             if (accepts_no_auth) {
-                prepare_greeting_response(state, SOCKS_METHOD_NO_AUTH);
+                prepare_greeting_response(state, SOCKS5_METHOD_NO_AUTH);
                 state->stage = CLIENT_STAGE_REQUEST;
             } else {
-                prepare_greeting_response(state, SOCKS_METHOD_NO_ACCEPTABLE);
+                prepare_greeting_response(state, SOCKS5_METHOD_NO_ACCEPTABLE);
                 state->stage = CLIENT_STAGE_CLOSING;
             }
 
@@ -460,32 +437,20 @@ static void client_read(struct selector_key *key) {
         }
 
         if (state->stage == CLIENT_STAGE_REQUEST) {
-            if (state->read_len < 10) {
+            if (state->read_len < SOCKS5_IPV4_REQUEST_SIZE) {
                 return;
             }
 
-            uint8_t version = state->read_buffer[0];
-            uint8_t cmd = state->read_buffer[1];
-            uint8_t rsv = state->read_buffer[2];
-            uint8_t atyp = state->read_buffer[3];
-
-            if (version != SOCKS_VERSION ||
-                cmd != SOCKS_CMD_CONNECT ||
-                rsv != 0x00 ||
-                atyp != SOCKS_ATYP_IPV4) {
-                prepare_request_response(state, SOCKS_REPLY_GENERAL_FAILURE);
+            if (!socks5_parse_ipv4_connect(
+                    state->read_buffer,
+                    state->read_len,
+                    &state->target_addr
+                )) {
+                prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
                 state->stage = CLIENT_STAGE_CLOSING;
                 selector_set_interest_key(key, OP_WRITE);
                 return;
             }
-
-            uint16_t port = ((uint16_t) state->read_buffer[8] << 8)
-                | (uint16_t) state->read_buffer[9];
-
-            memset(&state->target_addr, 0, sizeof(state->target_addr));
-            state->target_addr.sin_family = AF_INET;
-            memcpy(&state->target_addr.sin_addr.s_addr, state->read_buffer + 4, 4);
-            state->target_addr.sin_port = htons(port);
 
             bool connected = connect_to_target(state);
             bool relay_ready = false;
@@ -509,7 +474,7 @@ static void client_read(struct selector_key *key) {
 
             prepare_request_response(
                 state,
-                relay_ready ? SOCKS_REPLY_SUCCESS : SOCKS_REPLY_GENERAL_FAILURE
+                relay_ready ? SOCKS5_REPLY_SUCCESS : SOCKS5_REPLY_GENERAL_FAILURE
             );
             state->stage = relay_ready ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
             selector_set_interest_key(key, OP_WRITE);
