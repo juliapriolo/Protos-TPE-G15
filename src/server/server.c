@@ -15,6 +15,14 @@
 
 #include "../utils/include/selector.h"
 
+#define SOCKS_VERSION 0x05
+#define SOCKS_METHOD_NO_AUTH 0x00
+#define SOCKS_METHOD_NO_ACCEPTABLE 0xFF
+#define SOCKS_CMD_CONNECT 0x01
+#define SOCKS_ATYP_IPV4 0x01
+#define SOCKS_REPLY_SUCCESS 0x00
+#define SOCKS_REPLY_GENERAL_FAILURE 0x01
+
 static volatile sig_atomic_t done = 0;
 
 static void sigterm_handler(const int signal) {
@@ -86,10 +94,79 @@ static int create_passive_socket(const char *host, const char *port) {
     return server_fd;
 }
 
+static void update_relay_interests(fd_selector selector, client_state_t *state) {
+    if (state == NULL || !state->relay_started) {
+        return;
+    }
+
+    if (state->client_fd != -1) {
+        fd_interest interest = OP_NOOP;
+
+        if (state->c2t_len == 0) {
+            interest |= OP_READ;
+        }
+
+        if (state->t2c_len > state->t2c_off) {
+            interest |= OP_WRITE;
+        }
+
+        selector_set_interest(selector, state->client_fd, interest);
+    }
+
+    if (state->target_fd != -1) {
+        fd_interest interest = OP_NOOP;
+
+        if (state->t2c_len == 0) {
+            interest |= OP_READ;
+        }
+
+        if (state->c2t_len > state->c2t_off) {
+            interest |= OP_WRITE;
+        }
+
+        selector_set_interest(selector, state->target_fd, interest);
+    }
+}
+
+static void close_connection(fd_selector selector, client_state_t *state) {
+    if (state == NULL) {
+        return;
+    }
+
+    if (state->client_fd != -1) {
+        int client_fd = state->client_fd;
+        state->client_fd = -1;
+        selector_unregister_fd(selector, client_fd);
+        return;
+    }
+
+    if (state->target_fd != -1) {
+        int target_fd = state->target_fd;
+        state->target_fd = -1;
+
+        if (selector_unregister_fd(selector, target_fd) != SELECTOR_SUCCESS) {
+            close(target_fd);
+        }
+    }
+}
+
 static void client_close(struct selector_key *key) {
     client_state_t *state = key->data;
 
     if (state != NULL) {
+        if (state->client_fd == key->fd) {
+            state->client_fd = -1;
+        }
+
+        if (state->target_fd != -1) {
+            int target_fd = state->target_fd;
+            state->target_fd = -1;
+
+            if (selector_unregister_fd(key->s, target_fd) != SELECTOR_SUCCESS) {
+                close(target_fd);
+            }
+        }
+
         free(state);
     }
 
@@ -116,33 +193,230 @@ static void client_write(struct selector_key *key) {
             return;
         }
 
-        selector_unregister_fd(key->s, key->fd);
-        client_close(key);
+        close_connection(key->s, state);
         return;
     }
 
-    state->write_len = 0;
-    state->write_off = 0;
+    if (state->write_len > 0) {
+        state->write_len = 0;
+        state->write_off = 0;
 
-    if (state->stage == CLIENT_STAGE_CLOSING) {
-        selector_unregister_fd(key->s, key->fd);
+        if (state->stage == CLIENT_STAGE_CLOSING) {
+            selector_unregister_fd(key->s, key->fd);
+            return;
+        }
+
+        if (state->stage == CLIENT_STAGE_RELAY && !state->relay_started) {
+            state->relay_started = true;
+            update_relay_interests(key->s, state);
+            return;
+        }
+
+        selector_set_interest_key(key, OP_READ);
         return;
     }
 
-    selector_set_interest_key(key, OP_READ);
+    if (state->stage != CLIENT_STAGE_RELAY) {
+        selector_set_interest_key(key, OP_READ);
+        return;
+    }
+
+    while (state->t2c_off < state->t2c_len) {
+        ssize_t sent = send(
+            key->fd,
+            state->t2c_buffer + state->t2c_off,
+            state->t2c_len - state->t2c_off,
+            MSG_NOSIGNAL
+        );
+
+        if (sent > 0) {
+            state->t2c_off += (size_t) sent;
+            continue;
+        }
+
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+
+        close_connection(key->s, state);
+        return;
+    }
+
+    state->t2c_len = 0;
+    state->t2c_off = 0;
+    update_relay_interests(key->s, state);
 }
 
-static void prepare_test_response(client_state_t *state) {
-    const char *message = "SOCKS5 server skeleton alive\n";
+static bool client_offers_no_auth(const uint8_t *methods, size_t nmethods) {
+    for (size_t i = 0; i < nmethods; i++) {
+        if (methods[i] == SOCKS_METHOD_NO_AUTH) {
+            return true;
+        }
+    }
+    return false;
+}
 
-    state->write_len = strlen(message);
+static void prepare_greeting_response(client_state_t *state, uint8_t method) {
+    state->write_buffer[0] = SOCKS_VERSION;
+    state->write_buffer[1] = method;
+    state->write_len = 2;
     state->write_off = 0;
-
-    memcpy(state->write_buffer, message, state->write_len);
 }
+
+static void prepare_request_response(client_state_t *state, uint8_t reply) {
+    state->write_buffer[0] = SOCKS_VERSION;
+    state->write_buffer[1] = reply;
+    state->write_buffer[2] = 0x00;
+    state->write_buffer[3] = SOCKS_ATYP_IPV4;
+
+    state->write_buffer[4] = 0x00;
+    state->write_buffer[5] = 0x00;
+    state->write_buffer[6] = 0x00;
+    state->write_buffer[7] = 0x00;
+
+    state->write_buffer[8] = 0x00;
+    state->write_buffer[9] = 0x00;
+
+    state->write_len = 10;
+    state->write_off = 0;
+}
+
+static bool connect_to_target(client_state_t *state) {
+    int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (target_fd == -1) {
+        return false;
+    }
+
+    state->target_fd = target_fd;
+
+    if (connect(
+            target_fd,
+            (const struct sockaddr *) &state->target_addr,
+            sizeof(state->target_addr)
+        ) == -1) {
+        close(state->target_fd);
+        state->target_fd = -1;
+        return false;
+    }
+
+    return true;
+}
+
+static void target_close(struct selector_key *key) {
+    client_state_t *state = key->data;
+
+    if (state != NULL && state->target_fd == key->fd) {
+        state->target_fd = -1;
+    }
+
+    close(key->fd);
+}
+
+static void target_read(struct selector_key *key) {
+    client_state_t *state = key->data;
+
+    if (state->t2c_len != 0) {
+        update_relay_interests(key->s, state);
+        return;
+    }
+
+    ssize_t received = recv(
+        key->fd,
+        state->t2c_buffer,
+        sizeof(state->t2c_buffer),
+        0
+    );
+
+    if (received > 0) {
+        state->t2c_len = (size_t) received;
+        state->t2c_off = 0;
+        update_relay_interests(key->s, state);
+        return;
+    }
+
+    if (received == 0) {
+        close_connection(key->s, state);
+        return;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return;
+    }
+
+    close_connection(key->s, state);
+}
+
+static void target_write(struct selector_key *key) {
+    client_state_t *state = key->data;
+
+    while (state->c2t_off < state->c2t_len) {
+        ssize_t sent = send(
+            key->fd,
+            state->c2t_buffer + state->c2t_off,
+            state->c2t_len - state->c2t_off,
+            MSG_NOSIGNAL
+        );
+
+        if (sent > 0) {
+            state->c2t_off += (size_t) sent;
+            continue;
+        }
+
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+
+        close_connection(key->s, state);
+        return;
+    }
+
+    state->c2t_len = 0;
+    state->c2t_off = 0;
+    update_relay_interests(key->s, state);
+}
+
+static const fd_handler target_handler = {
+    .handle_read = target_read,
+    .handle_write = target_write,
+    .handle_close = target_close,
+};
 
 static void client_read(struct selector_key *key) {
     client_state_t *state = key->data;
+
+    if (state->stage == CLIENT_STAGE_RELAY) {
+        if (state->c2t_len != 0) {
+            update_relay_interests(key->s, state);
+            return;
+        }
+
+        ssize_t received = recv(
+            key->fd,
+            state->c2t_buffer,
+            sizeof(state->c2t_buffer),
+            0
+        );
+
+        if (received > 0) {
+            state->c2t_len = (size_t) received;
+            state->c2t_off = 0;
+            update_relay_interests(key->s, state);
+            return;
+        }
+
+        if (received == 0) {
+            close_connection(key->s, state);
+            return;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return;
+        }
+
+        close_connection(key->s, state);
+        return;
+    }
 
     ssize_t received = recv(
         key->fd,
@@ -154,27 +428,97 @@ static void client_read(struct selector_key *key) {
     if (received > 0) {
         state->read_len = (size_t) received;
 
-        /*
-         * Por ahora esto NO parsea SOCKS5.
-         * Este punto después se reemplaza por:
-         *
-         * CLIENT_STAGE_GREETING:
-         *   leer VER, NMETHODS, METHODS
-         *
-         * CLIENT_STAGE_REQUEST:
-         *   leer CMD, ATYP, DST.ADDR, DST.PORT
-         *
-         * CLIENT_STAGE_RELAY:
-         *   copiar bytes entre cliente y destino
-         */
+        if (state->stage == CLIENT_STAGE_GREETING) {
+            if (state->read_len < 2) {
+                selector_unregister_fd(key->s, key->fd);
+                return;
+            }
 
-        prepare_test_response(state);
-        selector_set_interest_key(key, OP_WRITE);
-        return;
+            uint8_t version = state->read_buffer[0];
+            uint8_t nmethods = state->read_buffer[1];
+
+            if (version != SOCKS_VERSION || state->read_len < 2 + nmethods) {
+                selector_unregister_fd(key->s, key->fd);
+                return;
+            }
+
+            bool accepts_no_auth = client_offers_no_auth(
+                state->read_buffer + 2,
+                nmethods
+            );
+
+            if (accepts_no_auth) {
+                prepare_greeting_response(state, SOCKS_METHOD_NO_AUTH);
+                state->stage = CLIENT_STAGE_REQUEST;
+            } else {
+                prepare_greeting_response(state, SOCKS_METHOD_NO_ACCEPTABLE);
+                state->stage = CLIENT_STAGE_CLOSING;
+            }
+
+            selector_set_interest_key(key, OP_WRITE);
+            return;
+        }
+
+        if (state->stage == CLIENT_STAGE_REQUEST) {
+            if (state->read_len < 10) {
+                return;
+            }
+
+            uint8_t version = state->read_buffer[0];
+            uint8_t cmd = state->read_buffer[1];
+            uint8_t rsv = state->read_buffer[2];
+            uint8_t atyp = state->read_buffer[3];
+
+            if (version != SOCKS_VERSION ||
+                cmd != SOCKS_CMD_CONNECT ||
+                rsv != 0x00 ||
+                atyp != SOCKS_ATYP_IPV4) {
+                prepare_request_response(state, SOCKS_REPLY_GENERAL_FAILURE);
+                state->stage = CLIENT_STAGE_CLOSING;
+                selector_set_interest_key(key, OP_WRITE);
+                return;
+            }
+
+            uint16_t port = ((uint16_t) state->read_buffer[8] << 8)
+                | (uint16_t) state->read_buffer[9];
+
+            memset(&state->target_addr, 0, sizeof(state->target_addr));
+            state->target_addr.sin_family = AF_INET;
+            memcpy(&state->target_addr.sin_addr.s_addr, state->read_buffer + 4, 4);
+            state->target_addr.sin_port = htons(port);
+
+            bool connected = connect_to_target(state);
+            bool relay_ready = false;
+
+            if (connected && set_nonblocking(state->target_fd) != -1) {
+                selector_status status = selector_register(
+                    key->s,
+                    state->target_fd,
+                    &target_handler,
+                    OP_NOOP,
+                    state
+                );
+
+                relay_ready = status == SELECTOR_SUCCESS;
+            }
+
+            if (connected && !relay_ready) {
+                close(state->target_fd);
+                state->target_fd = -1;
+            }
+
+            prepare_request_response(
+                state,
+                relay_ready ? SOCKS_REPLY_SUCCESS : SOCKS_REPLY_GENERAL_FAILURE
+            );
+            state->stage = relay_ready ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
+            selector_set_interest_key(key, OP_WRITE);
+            return;
+        }
     }
 
     if (received == 0) {
-        selector_unregister_fd(key->s, key->fd);
+        close_connection(key->s, state);
         return;
     }
 
@@ -182,7 +526,7 @@ static void client_read(struct selector_key *key) {
         return;
     }
 
-    selector_unregister_fd(key->s, key->fd);
+    close_connection(key->s, state);
 }
 
 static const fd_handler client_handler = {
@@ -224,6 +568,8 @@ static void accept_connection(struct selector_key *key) {
         }
 
         state->stage = CLIENT_STAGE_GREETING;
+        state->client_fd = client_fd;
+        state->target_fd = -1;
 
         selector_status status = selector_register(
             key->s,
@@ -259,7 +605,15 @@ int server_run(const char *host, const char *port) {
         return 1;
     }
 
-    if (selector_init(NULL) != SELECTOR_SUCCESS) {
+    struct selector_init conf = {
+        .signal = SIGALRM,
+        .select_timeout = {
+            .tv_sec = 10,
+            .tv_nsec = 0,
+        },
+    };
+
+    if (selector_init(&conf) != SELECTOR_SUCCESS) {
         close(server_fd);
         fprintf(stderr, "selector_init failed\n");
         return 1;
@@ -304,6 +658,8 @@ int server_run(const char *host, const char *port) {
 
     return 0;
 }
+
+
 
 int main(int argc, char *argv[]) {
     const char *port = "1080";
