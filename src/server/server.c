@@ -15,8 +15,11 @@
 #include <sys/types.h>
 
 #include "../utils/include/selector.h"
+#include "../utils/include/args.h"
 
 static volatile sig_atomic_t done = 0;
+static struct users *configured_users = NULL;
+static size_t configured_users_count = 0;
 
 static void sigterm_handler(const int signal) {
     (void) signal;
@@ -258,6 +261,73 @@ static void prepare_request_response(client_state_t *state, uint8_t reply) {
     );
 }
 
+static void prepare_auth_response(client_state_t *state, uint8_t status) {
+    socks5_prepare_auth_response(
+        state->write_buffer,
+        &state->write_len,
+        &state->write_off,
+        status
+    );
+}
+
+static bool requires_authentication(void) {
+    return configured_users_count > 0;
+}
+
+static bool credentials_are_valid(const uint8_t *username,
+                                  uint8_t username_len,
+                                  const uint8_t *password,
+                                  uint8_t password_len) {
+    for (size_t i = 0; i < configured_users_count; i++) {
+        const char *name = configured_users[i].name;
+        const char *pass = configured_users[i].pass;
+
+        if (strlen(name) == username_len &&
+            strlen(pass) == password_len &&
+            memcmp(name, username, username_len) == 0 &&
+            memcmp(pass, password, password_len) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool parse_auth_request(client_state_t *state, bool *authenticated) {
+    *authenticated = false;
+
+    if (state->read_len < 2) {
+        return false;
+    }
+
+    if (state->read_buffer[0] != SOCKS5_AUTH_VERSION) {
+        return true;
+    }
+
+    uint8_t username_len = state->read_buffer[1];
+    size_t password_len_index = 2 + (size_t) username_len;
+
+    if (state->read_len < password_len_index + 1) {
+        return false;
+    }
+
+    uint8_t password_len = state->read_buffer[password_len_index];
+    size_t expected_len = password_len_index + 1 + (size_t) password_len;
+
+    if (state->read_len < expected_len) {
+        return false;
+    }
+
+    *authenticated = credentials_are_valid(
+        state->read_buffer + 2,
+        username_len,
+        state->read_buffer + password_len_index + 1,
+        password_len
+    );
+
+    return true;
+}
+
 static bool connect_to_target(client_state_t *state) {
     int target_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -397,17 +467,16 @@ static void client_read(struct selector_key *key) {
 
     ssize_t received = recv(
         key->fd,
-        state->read_buffer,
-        sizeof(state->read_buffer),
+        state->read_buffer + state->read_len,
+        sizeof(state->read_buffer) - state->read_len,
         0
     );
 
     if (received > 0) {
-        state->read_len = (size_t) received;
+        state->read_len += (size_t) received;
 
         if (state->stage == CLIENT_STAGE_GREETING) {
             if (state->read_len < 2) {
-                selector_unregister_fd(key->s, key->fd);
                 return;
             }
 
@@ -415,16 +484,26 @@ static void client_read(struct selector_key *key) {
             uint8_t nmethods = state->read_buffer[1];
 
             if (version != SOCKS5_VERSION || state->read_len < 2 + nmethods) {
+                if (version == SOCKS5_VERSION) {
+                    return;
+                }
                 selector_unregister_fd(key->s, key->fd);
                 return;
             }
 
+            bool accepts_username_password = socks5_client_offers_username_password(
+                state->read_buffer + 2,
+                nmethods
+            );
             bool accepts_no_auth = socks5_client_offers_no_auth(
                 state->read_buffer + 2,
                 nmethods
             );
 
-            if (accepts_no_auth) {
+            if (requires_authentication() && accepts_username_password) {
+                prepare_greeting_response(state, SOCKS5_METHOD_USERNAME_PASSWORD);
+                state->stage = CLIENT_STAGE_AUTH;
+            } else if (!requires_authentication() && accepts_no_auth) {
                 prepare_greeting_response(state, SOCKS5_METHOD_NO_AUTH);
                 state->stage = CLIENT_STAGE_REQUEST;
             } else {
@@ -432,12 +511,52 @@ static void client_read(struct selector_key *key) {
                 state->stage = CLIENT_STAGE_CLOSING;
             }
 
+            state->read_len = 0;
+            selector_set_interest_key(key, OP_WRITE);
+            return;
+        }
+
+        if (state->stage == CLIENT_STAGE_AUTH) {
+            bool authenticated = false;
+
+            if (!parse_auth_request(state, &authenticated)) {
+                return;
+            }
+
+            prepare_auth_response(
+                state,
+                authenticated ? SOCKS5_AUTH_SUCCESS : SOCKS5_AUTH_FAILURE
+            );
+            state->stage = authenticated ? CLIENT_STAGE_REQUEST : CLIENT_STAGE_CLOSING;
+            state->read_len = 0;
             selector_set_interest_key(key, OP_WRITE);
             return;
         }
 
         if (state->stage == CLIENT_STAGE_REQUEST) {
-            if (state->read_len < SOCKS5_IPV4_REQUEST_SIZE) {
+            if (state->read_len < 4) {
+                return;
+            }
+
+            uint8_t request_reply = socks5_request_reply_for(
+                state->read_buffer,
+                state->read_len
+            );
+
+            if (request_reply != SOCKS5_REPLY_SUCCESS) {
+                if (request_reply == SOCKS5_REPLY_GENERAL_FAILURE &&
+                    state->read_buffer[0] == SOCKS5_VERSION &&
+                    state->read_buffer[1] == SOCKS5_CMD_CONNECT &&
+                    state->read_buffer[2] == 0x00 &&
+                    state->read_buffer[3] == SOCKS5_ATYP_IPV4 &&
+                    state->read_len < SOCKS5_IPV4_REQUEST_SIZE) {
+                    return;
+                }
+
+                prepare_request_response(state, request_reply);
+                state->stage = CLIENT_STAGE_CLOSING;
+                state->read_len = 0;
+                selector_set_interest_key(key, OP_WRITE);
                 return;
             }
 
@@ -448,6 +567,7 @@ static void client_read(struct selector_key *key) {
                 )) {
                 prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
                 state->stage = CLIENT_STAGE_CLOSING;
+                state->read_len = 0;
                 selector_set_interest_key(key, OP_WRITE);
                 return;
             }
@@ -477,6 +597,7 @@ static void client_read(struct selector_key *key) {
                 relay_ready ? SOCKS5_REPLY_SUCCESS : SOCKS5_REPLY_GENERAL_FAILURE
             );
             state->stage = relay_ready ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
+            state->read_len = 0;
             selector_set_interest_key(key, OP_WRITE);
             return;
         }
@@ -627,11 +748,20 @@ int server_run(const char *host, const char *port) {
 
 
 int main(int argc, char *argv[]) {
-    const char *port = "1080";
+    struct socks5args args;
+    char port[6];
+    size_t users_count = 0;
 
-    if (argc > 1) {
-        port = argv[1];
+    parse_args(argc, argv, &args);
+
+    for (size_t i = 0; i < MAX_USERS && args.users[i].name != NULL; i++) {
+        users_count++;
     }
 
-    return server_run(NULL, port);
+    configured_users = args.users;
+    configured_users_count = users_count;
+
+    snprintf(port, sizeof(port), "%hu", args.socks_port);
+
+    return server_run(args.socks_addr, port);
 }

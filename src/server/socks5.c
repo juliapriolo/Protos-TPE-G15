@@ -12,6 +12,16 @@ bool socks5_client_offers_no_auth(const uint8_t *methods, size_t nmethods) {
     return false;
 }
 
+bool socks5_client_offers_username_password(const uint8_t *methods, size_t nmethods) {
+    for (size_t i = 0; i < nmethods; i++) {
+        if (methods[i] == SOCKS5_METHOD_USERNAME_PASSWORD) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void socks5_prepare_greeting_response(
     uint8_t *buffer,
     size_t *len,
@@ -45,6 +55,42 @@ void socks5_prepare_request_response(
 
     *len = SOCKS5_RESPONSE_SIZE;
     *off = 0;
+}
+
+void socks5_prepare_auth_response(
+    uint8_t *buffer,
+    size_t *len,
+    size_t *off,
+    uint8_t status
+) {
+    buffer[0] = SOCKS5_AUTH_VERSION;
+    buffer[1] = status;
+
+    *len = SOCKS5_AUTH_RESPONSE_SIZE;
+    *off = 0;
+}
+
+uint8_t socks5_request_reply_for(
+    const uint8_t *buffer,
+    size_t len
+) {
+    if (len < 4 || buffer[0] != SOCKS5_VERSION || buffer[2] != 0x00) {
+        return SOCKS5_REPLY_GENERAL_FAILURE;
+    }
+
+    if (buffer[1] != SOCKS5_CMD_CONNECT) {
+        return SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
+    }
+
+    if (buffer[3] != SOCKS5_ATYP_IPV4) {
+        return SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED;
+    }
+
+    if (len < SOCKS5_IPV4_REQUEST_SIZE) {
+        return SOCKS5_REPLY_GENERAL_FAILURE;
+    }
+
+    return SOCKS5_REPLY_SUCCESS;
 }
 
 bool socks5_parse_ipv4_connect(
