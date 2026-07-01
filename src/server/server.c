@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,6 +21,17 @@
 static volatile sig_atomic_t done = 0;
 static struct users *configured_users = NULL;
 static size_t configured_users_count = 0;
+
+typedef struct resolver_job {
+    fd_selector selector;
+    int client_fd;
+    client_state_t *state;
+    char host[SOCKS5_MAX_DOMAIN_LENGTH + 1];
+    char port[6];
+} resolver_job_t;
+
+static uint8_t socks5_reply_for_errno(int error);
+static bool start_next_target_connection(fd_selector selector, client_state_t *state);
 
 static void sigterm_handler(const int signal) {
     (void) signal;
@@ -124,6 +136,14 @@ static void update_relay_interests(fd_selector selector, client_state_t *state) 
     }
 }
 
+static void free_target_addresses(client_state_t *state) {
+    if (state != NULL && state->target_addresses != NULL) {
+        freeaddrinfo(state->target_addresses);
+        state->target_addresses = NULL;
+        state->target_address_current = NULL;
+    }
+}
+
 static void close_connection(fd_selector selector, client_state_t *state) {
     if (state == NULL) {
         return;
@@ -163,6 +183,7 @@ static void client_close(struct selector_key *key) {
             }
         }
 
+        free_target_addresses(state);
         free(state);
     }
 
@@ -328,25 +349,92 @@ static bool parse_auth_request(client_state_t *state, bool *authenticated) {
     return true;
 }
 
-static bool connect_to_target(client_state_t *state) {
-    int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+static uint8_t socks5_reply_for_errno(int error) {
+    switch (error) {
+    case 0:
+        return SOCKS5_REPLY_SUCCESS;
+    case ENETUNREACH:
+        return SOCKS5_REPLY_NETWORK_UNREACHABLE;
+    case EHOSTUNREACH:
+    case EHOSTDOWN:
+#ifdef ENODATA
+    case ENODATA:
+#endif
+        return SOCKS5_REPLY_HOST_UNREACHABLE;
+    case ECONNREFUSED:
+        return SOCKS5_REPLY_CONNECTION_REFUSED;
+    case ETIMEDOUT:
+        return SOCKS5_REPLY_TTL_EXPIRED;
+    default:
+        return SOCKS5_REPLY_GENERAL_FAILURE;
+    }
+}
 
-    if (target_fd == -1) {
+static uint8_t socks5_reply_for_gai_error(int error) {
+    switch (error) {
+    case 0:
+        return SOCKS5_REPLY_SUCCESS;
+    case EAI_AGAIN:
+        return SOCKS5_REPLY_TTL_EXPIRED;
+    case EAI_NONAME:
+#ifdef EAI_NODATA
+    case EAI_NODATA:
+#endif
+        return SOCKS5_REPLY_HOST_UNREACHABLE;
+    default:
+        return SOCKS5_REPLY_GENERAL_FAILURE;
+    }
+}
+
+static void *resolve_target(void *data) {
+    resolver_job_t *job = data;
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int status = getaddrinfo(job->host, job->port, &hints, &result);
+
+    job->state->target_addresses = result;
+    job->state->target_address_current = result;
+    job->state->resolver_status = status;
+    job->state->resolver_done = true;
+
+    selector_notify_block(job->selector, job->client_fd);
+    free(job);
+    return NULL;
+}
+
+static bool start_target_resolution(fd_selector selector,
+                                    client_state_t *state,
+                                    const char *host,
+                                    uint16_t port) {
+    resolver_job_t *job = calloc(1, sizeof(*job));
+
+    if (job == NULL) {
         return false;
     }
 
-    state->target_fd = target_fd;
+    job->selector = selector;
+    job->client_fd = state->client_fd;
+    job->state = state;
+    snprintf(job->host, sizeof(job->host), "%s", host);
+    snprintf(job->port, sizeof(job->port), "%hu", port);
 
-    if (connect(
-            target_fd,
-            (const struct sockaddr *) &state->target_addr,
-            sizeof(state->target_addr)
-        ) == -1) {
-        close(state->target_fd);
-        state->target_fd = -1;
+    state->resolver_done = false;
+    state->resolver_status = EAI_AGAIN;
+
+    pthread_t resolver_thread;
+    int status = pthread_create(&resolver_thread, NULL, resolve_target, job);
+
+    if (status != 0) {
+        free(job);
         return false;
     }
 
+    pthread_detach(resolver_thread);
     return true;
 }
 
@@ -394,8 +482,52 @@ static void target_read(struct selector_key *key) {
     close_connection(key->s, state);
 }
 
+static bool target_connection_succeeded(int fd, int *socket_error) {
+    int error = 0;
+    socklen_t socket_error_len = sizeof(error);
+
+    if (getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_ERROR,
+            &error,
+            &socket_error_len
+        ) == -1) {
+        *socket_error = errno;
+        return false;
+    }
+
+    *socket_error = error;
+    return *socket_error == 0;
+}
+
 static void target_write(struct selector_key *key) {
     client_state_t *state = key->data;
+
+    if (state->stage == CLIENT_STAGE_CONNECTING) {
+        int socket_error = 0;
+        bool connected = target_connection_succeeded(key->fd, &socket_error);
+
+        if (!connected) {
+            state->last_connect_error = socket_error;
+            selector_unregister_fd(key->s, key->fd);
+
+            if (start_next_target_connection(key->s, state)) {
+                return;
+            }
+        } else {
+            selector_set_interest(key->s, key->fd, OP_NOOP);
+        }
+
+        prepare_request_response(
+            state,
+            connected ? SOCKS5_REPLY_SUCCESS :
+                        socks5_reply_for_errno(state->last_connect_error)
+        );
+        state->stage = connected ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
+        selector_set_interest(key->s, state->client_fd, OP_WRITE);
+        return;
+    }
 
     while (state->c2t_off < state->c2t_len) {
         ssize_t sent = send(
@@ -428,6 +560,130 @@ static const fd_handler target_handler = {
     .handle_write = target_write,
     .handle_close = target_close,
 };
+
+static bool register_connecting_socket(fd_selector selector,
+                                       client_state_t *state,
+                                       int target_fd) {
+    selector_status status = selector_register(
+        selector,
+        target_fd,
+        &target_handler,
+        OP_WRITE,
+        state
+    );
+
+    if (status != SELECTOR_SUCCESS) {
+        state->last_connect_error = errno;
+        close(target_fd);
+        state->target_fd = -1;
+        return false;
+    }
+
+    state->stage = CLIENT_STAGE_CONNECTING;
+    return true;
+}
+
+static bool start_target_connection(fd_selector selector,
+                                    client_state_t *state,
+                                    const struct sockaddr *addr,
+                                    socklen_t addr_len) {
+    int target_fd = socket(addr->sa_family, SOCK_STREAM, 0);
+
+    if (target_fd == -1) {
+        state->last_connect_error = errno;
+        return false;
+    }
+
+    if (set_nonblocking(target_fd) == -1) {
+        state->last_connect_error = errno;
+        close(target_fd);
+        return false;
+    }
+
+    state->target_fd = target_fd;
+
+    if (connect(
+            target_fd,
+            addr,
+            addr_len
+        ) == -1 && errno != EINPROGRESS) {
+        state->last_connect_error = errno;
+        close(state->target_fd);
+        state->target_fd = -1;
+        return false;
+    }
+
+    return register_connecting_socket(selector, state, target_fd);
+}
+
+static bool start_next_target_connection(fd_selector selector, client_state_t *state) {
+    while (state->target_address_current != NULL) {
+        struct addrinfo *current = state->target_address_current;
+        state->target_address_current = current->ai_next;
+
+        if (current->ai_family != AF_INET && current->ai_family != AF_INET6) {
+            continue;
+        }
+
+        if (start_target_connection(
+                selector,
+                state,
+                current->ai_addr,
+                (socklen_t) current->ai_addrlen
+            )) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void begin_request_connection(struct selector_key *key,
+                                     client_state_t *state,
+                                     const socks5_request_t *request) {
+    free_target_addresses(state);
+    state->last_connect_error = 0;
+
+    if (request->atyp == SOCKS5_ATYP_DOMAIN) {
+        bool resolution_started = start_target_resolution(
+            key->s,
+            state,
+            request->host,
+            request->port
+        );
+
+        if (!resolution_started) {
+            prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
+            state->stage = CLIENT_STAGE_CLOSING;
+            selector_set_interest_key(key, OP_WRITE);
+            return;
+        }
+
+        state->stage = CLIENT_STAGE_RESOLVING;
+        selector_set_interest_key(key, OP_NOOP);
+        return;
+    }
+
+    memcpy(&state->target_addr, &request->addr, sizeof(state->target_addr));
+    state->target_addr_len = request->addr_len;
+
+    if (!start_target_connection(
+            key->s,
+            state,
+            (const struct sockaddr *) &state->target_addr,
+            state->target_addr_len
+        )) {
+        prepare_request_response(
+            state,
+            socks5_reply_for_errno(state->last_connect_error)
+        );
+        state->stage = CLIENT_STAGE_CLOSING;
+        selector_set_interest_key(key, OP_WRITE);
+        return;
+    }
+
+    selector_set_interest_key(key, OP_NOOP);
+}
 
 static void client_read(struct selector_key *key) {
     client_state_t *state = key->data;
@@ -544,12 +800,7 @@ static void client_read(struct selector_key *key) {
             );
 
             if (request_reply != SOCKS5_REPLY_SUCCESS) {
-                if (request_reply == SOCKS5_REPLY_GENERAL_FAILURE &&
-                    state->read_buffer[0] == SOCKS5_VERSION &&
-                    state->read_buffer[1] == SOCKS5_CMD_CONNECT &&
-                    state->read_buffer[2] == 0x00 &&
-                    state->read_buffer[3] == SOCKS5_ATYP_IPV4 &&
-                    state->read_len < SOCKS5_IPV4_REQUEST_SIZE) {
+                if (socks5_request_is_incomplete(state->read_buffer, state->read_len)) {
                     return;
                 }
 
@@ -560,10 +811,12 @@ static void client_read(struct selector_key *key) {
                 return;
             }
 
-            if (!socks5_parse_ipv4_connect(
+            socks5_request_t request;
+
+            if (!socks5_parse_connect_request(
                     state->read_buffer,
                     state->read_len,
-                    &state->target_addr
+                    &request
                 )) {
                 prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
                 state->stage = CLIENT_STAGE_CLOSING;
@@ -572,33 +825,8 @@ static void client_read(struct selector_key *key) {
                 return;
             }
 
-            bool connected = connect_to_target(state);
-            bool relay_ready = false;
-
-            if (connected && set_nonblocking(state->target_fd) != -1) {
-                selector_status status = selector_register(
-                    key->s,
-                    state->target_fd,
-                    &target_handler,
-                    OP_NOOP,
-                    state
-                );
-
-                relay_ready = status == SELECTOR_SUCCESS;
-            }
-
-            if (connected && !relay_ready) {
-                close(state->target_fd);
-                state->target_fd = -1;
-            }
-
-            prepare_request_response(
-                state,
-                relay_ready ? SOCKS5_REPLY_SUCCESS : SOCKS5_REPLY_GENERAL_FAILURE
-            );
-            state->stage = relay_ready ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
+            begin_request_connection(key, state, &request);
             state->read_len = 0;
-            selector_set_interest_key(key, OP_WRITE);
             return;
         }
     }
@@ -615,9 +843,44 @@ static void client_read(struct selector_key *key) {
     close_connection(key->s, state);
 }
 
+static void client_block(struct selector_key *key) {
+    client_state_t *state = key->data;
+
+    if (state == NULL || state->stage != CLIENT_STAGE_RESOLVING) {
+        return;
+    }
+
+    if (!state->resolver_done) {
+        return;
+    }
+
+    if (state->resolver_status != 0 || state->target_addresses == NULL) {
+        prepare_request_response(
+            state,
+            socks5_reply_for_gai_error(state->resolver_status)
+        );
+        state->stage = CLIENT_STAGE_CLOSING;
+        selector_set_interest_key(key, OP_WRITE);
+        return;
+    }
+
+    if (!start_next_target_connection(key->s, state)) {
+        prepare_request_response(
+            state,
+            socks5_reply_for_errno(state->last_connect_error)
+        );
+        state->stage = CLIENT_STAGE_CLOSING;
+        selector_set_interest_key(key, OP_WRITE);
+        return;
+    }
+
+    selector_set_interest_key(key, OP_NOOP);
+}
+
 static const fd_handler client_handler = {
     .handle_read = client_read,
     .handle_write = client_write,
+    .handle_block = client_block,
     .handle_close = client_close,
 };
 

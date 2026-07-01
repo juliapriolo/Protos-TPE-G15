@@ -1,5 +1,6 @@
 #include "include/socks5.h"
 
+#include <arpa/inet.h>
 #include <string.h>
 
 bool socks5_client_offers_no_auth(const uint8_t *methods, size_t nmethods) {
@@ -82,36 +83,92 @@ uint8_t socks5_request_reply_for(
         return SOCKS5_REPLY_COMMAND_NOT_SUPPORTED;
     }
 
-    if (buffer[3] != SOCKS5_ATYP_IPV4) {
+    if (buffer[3] != SOCKS5_ATYP_IPV4 &&
+        buffer[3] != SOCKS5_ATYP_DOMAIN &&
+        buffer[3] != SOCKS5_ATYP_IPV6) {
         return SOCKS5_REPLY_ADDRESS_TYPE_NOT_SUPPORTED;
     }
 
-    if (len < SOCKS5_IPV4_REQUEST_SIZE) {
+    if (socks5_request_is_incomplete(buffer, len)) {
         return SOCKS5_REPLY_GENERAL_FAILURE;
     }
 
     return SOCKS5_REPLY_SUCCESS;
 }
 
-bool socks5_parse_ipv4_connect(
+bool socks5_request_is_incomplete(
+    const uint8_t *buffer,
+    size_t len
+) {
+    if (len < 4) {
+        return true;
+    }
+
+    switch (buffer[3]) {
+    case SOCKS5_ATYP_IPV4:
+        return len < SOCKS5_IPV4_REQUEST_SIZE;
+    case SOCKS5_ATYP_IPV6:
+        return len < SOCKS5_IPV6_REQUEST_SIZE;
+    case SOCKS5_ATYP_DOMAIN:
+        if (len < 5) {
+            return true;
+        }
+        return len < 5 + (size_t) buffer[4] + 2;
+    default:
+        return false;
+    }
+}
+
+bool socks5_parse_connect_request(
     const uint8_t *buffer,
     size_t len,
-    struct sockaddr_in *target_addr
+    socks5_request_t *request
 ) {
-    if (len < SOCKS5_IPV4_REQUEST_SIZE ||
-        buffer[0] != SOCKS5_VERSION ||
-        buffer[1] != SOCKS5_CMD_CONNECT ||
-        buffer[2] != 0x00 ||
-        buffer[3] != SOCKS5_ATYP_IPV4) {
+    uint8_t reply = socks5_request_reply_for(buffer, len);
+
+    if (reply != SOCKS5_REPLY_SUCCESS || request == NULL) {
         return false;
     }
 
-    uint16_t port = ((uint16_t) buffer[8] << 8) | (uint16_t) buffer[9];
+    memset(request, 0, sizeof(*request));
+    request->atyp = buffer[3];
 
-    memset(target_addr, 0, sizeof(*target_addr));
-    target_addr->sin_family = AF_INET;
-    memcpy(&target_addr->sin_addr.s_addr, buffer + 4, 4);
-    target_addr->sin_port = htons(port);
+    if (buffer[3] == SOCKS5_ATYP_IPV4) {
+        struct sockaddr_in *addr = (struct sockaddr_in *) &request->addr;
+        request->port = ((uint16_t) buffer[8] << 8) | (uint16_t) buffer[9];
 
-    return true;
+        addr->sin_family = AF_INET;
+        memcpy(&addr->sin_addr.s_addr, buffer + 4, 4);
+        addr->sin_port = htons(request->port);
+        request->addr_len = sizeof(*addr);
+        return true;
+    }
+
+    if (buffer[3] == SOCKS5_ATYP_IPV6) {
+        struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &request->addr;
+        request->port = ((uint16_t) buffer[20] << 8) | (uint16_t) buffer[21];
+
+        addr->sin6_family = AF_INET6;
+        memcpy(&addr->sin6_addr, buffer + 4, 16);
+        addr->sin6_port = htons(request->port);
+        request->addr_len = sizeof(*addr);
+        return true;
+    }
+
+    if (buffer[3] == SOCKS5_ATYP_DOMAIN) {
+        uint8_t domain_len = buffer[4];
+        size_t port_index = 5 + (size_t) domain_len;
+
+        if (domain_len == 0) {
+            return false;
+        }
+
+        memcpy(request->host, buffer + 5, domain_len);
+        request->host[domain_len] = '\0';
+        request->port = ((uint16_t) buffer[port_index] << 8) |
+                        (uint16_t) buffer[port_index + 1];
+        return true;
+    }
+
+    return false;
 }

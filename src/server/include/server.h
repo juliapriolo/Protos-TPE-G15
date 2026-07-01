@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <netinet/in.h>
+#include <netdb.h>
 
 #define SERVER_DEFAULT_PORT 1080
 #define SERVER_BACKLOG 128
@@ -14,6 +15,8 @@ typedef enum {
     CLIENT_STAGE_GREETING = 0,
     CLIENT_STAGE_AUTH,
     CLIENT_STAGE_REQUEST,
+    CLIENT_STAGE_RESOLVING,
+    CLIENT_STAGE_CONNECTING,
     CLIENT_STAGE_RELAY,
     CLIENT_STAGE_CLOSING
 } client_stage_t;
@@ -34,7 +37,13 @@ typedef struct client_state {
 
     int client_fd;
     int target_fd;
-    struct sockaddr_in target_addr;
+    struct sockaddr_storage target_addr;
+    socklen_t target_addr_len;
+    struct addrinfo *target_addresses;
+    struct addrinfo *target_address_current;
+    int last_connect_error;
+    int resolver_status;
+    bool resolver_done;
 
     client_stage_t stage;
     bool relay_started;
