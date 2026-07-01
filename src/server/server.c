@@ -22,13 +22,17 @@ static volatile sig_atomic_t done = 0;
 static struct users *configured_users = NULL;
 static size_t configured_users_count = 0;
 
-typedef struct resolver_job {
+struct resolver_job {
     fd_selector selector;
     int client_fd;
     client_state_t *state;
     char host[SOCKS5_MAX_DOMAIN_LENGTH + 1];
     char port[6];
-} resolver_job_t;
+    pthread_mutex_t mutex;
+    struct addrinfo *result;
+    int status;
+    bool done;
+};
 
 static uint8_t socks5_reply_for_errno(int error);
 static bool start_next_target_connection(fd_selector selector, client_state_t *state);
@@ -144,6 +148,31 @@ static void free_target_addresses(client_state_t *state) {
     }
 }
 
+static void detach_resolver_job(client_state_t *state) {
+    struct resolver_job *job = state->resolver_job;
+
+    if (job == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&job->mutex);
+    job->state = NULL;
+
+    if (job->done) {
+        if (job->result != NULL) {
+            freeaddrinfo(job->result);
+            job->result = NULL;
+        }
+        pthread_mutex_unlock(&job->mutex);
+        pthread_mutex_destroy(&job->mutex);
+        free(job);
+    } else {
+        pthread_mutex_unlock(&job->mutex);
+    }
+
+    state->resolver_job = NULL;
+}
+
 static void close_connection(fd_selector selector, client_state_t *state) {
     if (state == NULL) {
         return;
@@ -183,6 +212,7 @@ static void client_close(struct selector_key *key) {
             }
         }
 
+        detach_resolver_job(state);
         free_target_addresses(state);
         free(state);
     }
@@ -387,7 +417,7 @@ static uint8_t socks5_reply_for_gai_error(int error) {
 }
 
 static void *resolve_target(void *data) {
-    resolver_job_t *job = data;
+    struct resolver_job *job = data;
     struct addrinfo hints;
     struct addrinfo *result = NULL;
 
@@ -397,12 +427,25 @@ static void *resolve_target(void *data) {
 
     int status = getaddrinfo(job->host, job->port, &hints, &result);
 
-    job->state->target_addresses = result;
-    job->state->target_address_current = result;
-    job->state->resolver_status = status;
-    job->state->resolver_done = true;
+    pthread_mutex_lock(&job->mutex);
+    job->result = result;
+    job->status = status;
+    job->done = true;
 
-    selector_notify_block(job->selector, job->client_fd);
+    bool has_waiting_client = job->state != NULL;
+    fd_selector selector = job->selector;
+    int client_fd = job->client_fd;
+    pthread_mutex_unlock(&job->mutex);
+
+    if (has_waiting_client) {
+        selector_notify_block(selector, client_fd);
+        return NULL;
+    }
+
+    if (result != NULL) {
+        freeaddrinfo(result);
+    }
+    pthread_mutex_destroy(&job->mutex);
     free(job);
     return NULL;
 }
@@ -411,9 +454,14 @@ static bool start_target_resolution(fd_selector selector,
                                     client_state_t *state,
                                     const char *host,
                                     uint16_t port) {
-    resolver_job_t *job = calloc(1, sizeof(*job));
+    struct resolver_job *job = calloc(1, sizeof(*job));
 
     if (job == NULL) {
+        return false;
+    }
+
+    if (pthread_mutex_init(&job->mutex, NULL) != 0) {
+        free(job);
         return false;
     }
 
@@ -422,14 +470,15 @@ static bool start_target_resolution(fd_selector selector,
     job->state = state;
     snprintf(job->host, sizeof(job->host), "%s", host);
     snprintf(job->port, sizeof(job->port), "%hu", port);
-
-    state->resolver_done = false;
-    state->resolver_status = EAI_AGAIN;
+    job->status = EAI_AGAIN;
+    state->resolver_job = job;
 
     pthread_t resolver_thread;
     int status = pthread_create(&resolver_thread, NULL, resolve_target, job);
 
     if (status != 0) {
+        state->resolver_job = NULL;
+        pthread_mutex_destroy(&job->mutex);
         free(job);
         return false;
     }
@@ -645,6 +694,8 @@ static void begin_request_connection(struct selector_key *key,
     state->last_connect_error = 0;
 
     if (request->atyp == SOCKS5_ATYP_DOMAIN) {
+        detach_resolver_job(state);
+
         bool resolution_started = start_target_resolution(
             key->s,
             state,
@@ -845,24 +896,47 @@ static void client_read(struct selector_key *key) {
 
 static void client_block(struct selector_key *key) {
     client_state_t *state = key->data;
+    struct resolver_job *job;
+    struct addrinfo *result;
+    int status;
 
     if (state == NULL || state->stage != CLIENT_STAGE_RESOLVING) {
         return;
     }
 
-    if (!state->resolver_done) {
+    job = state->resolver_job;
+    if (job == NULL) {
         return;
     }
 
-    if (state->resolver_status != 0 || state->target_addresses == NULL) {
+    pthread_mutex_lock(&job->mutex);
+    if (!job->done) {
+        pthread_mutex_unlock(&job->mutex);
+        return;
+    }
+
+    result = job->result;
+    status = job->status;
+    job->result = NULL;
+    job->state = NULL;
+    pthread_mutex_unlock(&job->mutex);
+
+    pthread_mutex_destroy(&job->mutex);
+    free(job);
+    state->resolver_job = NULL;
+
+    if (status != 0 || result == NULL) {
         prepare_request_response(
             state,
-            socks5_reply_for_gai_error(state->resolver_status)
+            socks5_reply_for_gai_error(status)
         );
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
     }
+
+    state->target_addresses = result;
+    state->target_address_current = result;
 
     if (!start_next_target_connection(key->s, state)) {
         prepare_request_response(

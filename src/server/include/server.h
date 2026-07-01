@@ -11,6 +11,8 @@
 #define SERVER_BACKLOG 128
 #define SERVER_BUFFER_SIZE 4096
 
+struct resolver_job;
+
 typedef enum {
     CLIENT_STAGE_GREETING = 0,
     CLIENT_STAGE_AUTH,
@@ -41,9 +43,8 @@ typedef struct client_state {
     socklen_t target_addr_len;
     struct addrinfo *target_addresses;
     struct addrinfo *target_address_current;
+    struct resolver_job *resolver_job;
     int last_connect_error;
-    int resolver_status;
-    bool resolver_done;
 
     client_stage_t stage;
     bool relay_started;
