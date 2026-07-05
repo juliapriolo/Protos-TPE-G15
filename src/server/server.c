@@ -1003,10 +1003,17 @@ static void management_prepare_response(management_state_t *state) {
     state->read_buffer[state->read_len] = '\0';
     state->read_buffer[strcspn(state->read_buffer, "\r\n")] = '\0';
 
-    if (strcasecmp(state->read_buffer, "METRICS") == 0) {
+    if (strcasecmp(state->read_buffer, "STATS") == 0 ||
+        strcasecmp(state->read_buffer, "METRICS") == 0) {
         format_metrics_response(state->write_buffer, sizeof(state->write_buffer));
+    } else if (strcasecmp(state->read_buffer, "QUIT") == 0) {
+        snprintf(state->write_buffer, sizeof(state->write_buffer), "ok=bye\n");
     } else if (strcasecmp(state->read_buffer, "HELP") == 0) {
-        snprintf(state->write_buffer, sizeof(state->write_buffer), "commands=METRICS,HELP\n");
+        snprintf(
+            state->write_buffer,
+            sizeof(state->write_buffer),
+            "commands=STATS,METRICS,HELP,QUIT\n"
+        );
     } else {
         snprintf(state->write_buffer, sizeof(state->write_buffer), "error=unknown_command\n");
     }

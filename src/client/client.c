@@ -14,7 +14,7 @@
 static void usage(const char *program) {
     fprintf(
         stderr,
-        "Usage: %s [-L management_addr] [-P management_port] [METRICS|HELP]\n",
+        "Usage: %s [-L management_addr] [-P management_port] [STATS|METRICS|HELP|QUIT]\n",
         program
     );
 }
@@ -113,7 +113,7 @@ static bool print_response(int fd) {
 int main(int argc, char *argv[]) {
     const char *host = "127.0.0.1";
     const char *port = "8080";
-    const char *command = "METRICS";
+    const char *command = "STATS";
     int option;
 
     while ((option = getopt(argc, argv, "hL:P:")) != -1) {
