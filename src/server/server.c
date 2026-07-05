@@ -1,8 +1,10 @@
 #include "include/server.h"
 #include "include/socks5.h"
+#include "include/metrics.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
@@ -214,6 +216,7 @@ static void client_close(struct selector_key *key) {
 
         detach_resolver_job(state);
         free_target_addresses(state);
+        metrics_connection_closed();
         free(state);
     }
 
@@ -278,6 +281,7 @@ static void client_write(struct selector_key *key) {
 
         if (sent > 0) {
             state->t2c_off += (size_t) sent;
+            metrics_add_target_to_client_bytes((uint64_t) sent);
             continue;
         }
 
@@ -588,6 +592,7 @@ static void target_write(struct selector_key *key) {
 
         if (sent > 0) {
             state->c2t_off += (size_t) sent;
+            metrics_add_client_to_target_bytes((uint64_t) sent);
             continue;
         }
 
@@ -1005,6 +1010,8 @@ static void accept_connection(struct selector_key *key) {
         if (status != SELECTOR_SUCCESS) {
             free(state);
             close(client_fd);
+        } else {
+            metrics_connection_opened();
         }
     }
 }
@@ -1077,6 +1084,22 @@ int server_run(const char *host, const char *port) {
     close(server_fd);
 
     selector_destroy(selector);
+
+    server_metrics_t metrics = metrics_snapshot();
+
+    printf(
+        "Metrics: historical_connections=%" PRIu64
+        " concurrent_connections=%" PRIu64
+        " bytes_transferred=%" PRIu64
+        " bytes_client_to_target=%" PRIu64
+        " bytes_target_to_client=%" PRIu64 "\n",
+        metrics.historical_connections,
+        metrics.concurrent_connections,
+        metrics_total_transferred_bytes(&metrics),
+        metrics.bytes_client_to_target,
+        metrics.bytes_target_to_client
+    );
+
     selector_close();
 
     return 0;
