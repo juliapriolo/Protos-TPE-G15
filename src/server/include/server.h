@@ -10,6 +10,7 @@
 #define SERVER_DEFAULT_PORT 1080
 #define SERVER_BACKLOG 128
 #define SERVER_BUFFER_SIZE 4096
+#define MANAGEMENT_BUFFER_SIZE 1024
 
 struct resolver_job;
 
@@ -50,6 +51,17 @@ typedef struct client_state {
     bool relay_started;
 } client_state_t;
 
-int server_run(const char *host, const char *port);
+typedef struct management_state {
+    char read_buffer[MANAGEMENT_BUFFER_SIZE];
+    char write_buffer[MANAGEMENT_BUFFER_SIZE];
+    size_t read_len;
+    size_t write_len;
+    size_t write_off;
+} management_state_t;
+
+int server_run(const char *host,
+               const char *port,
+               const char *management_host,
+               const char *management_port);
 
 #endif

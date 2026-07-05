@@ -13,6 +13,14 @@ void metrics_connection_closed(void) {
     }
 }
 
+void metrics_connection_succeeded(void) {
+    current_metrics.successful_connections++;
+}
+
+void metrics_connection_failed(void) {
+    current_metrics.failed_connections++;
+}
+
 void metrics_add_client_to_target_bytes(uint64_t bytes) {
     current_metrics.bytes_client_to_target += bytes;
 }

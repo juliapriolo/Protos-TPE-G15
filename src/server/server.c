@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <sys/socket.h>
@@ -38,6 +39,7 @@ struct resolver_job {
 
 static uint8_t socks5_reply_for_errno(int error);
 static bool start_next_target_connection(fd_selector selector, client_state_t *state);
+static void format_metrics_response(char *buffer, size_t buffer_size);
 
 static void sigterm_handler(const int signal) {
     (void) signal;
@@ -106,6 +108,29 @@ static int create_passive_socket(const char *host, const char *port) {
 
     freeaddrinfo(result);
     return server_fd;
+}
+
+static void format_metrics_response(char *buffer, size_t buffer_size) {
+    server_metrics_t metrics = metrics_snapshot();
+
+    snprintf(
+        buffer,
+        buffer_size,
+        "historical_connections=%" PRIu64 "\n"
+        "concurrent_connections=%" PRIu64 "\n"
+        "successful_connections=%" PRIu64 "\n"
+        "failed_connections=%" PRIu64 "\n"
+        "bytes_transferred=%" PRIu64 "\n"
+        "bytes_client_to_target=%" PRIu64 "\n"
+        "bytes_target_to_client=%" PRIu64 "\n",
+        metrics.historical_connections,
+        metrics.concurrent_connections,
+        metrics.successful_connections,
+        metrics.failed_connections,
+        metrics_total_transferred_bytes(&metrics),
+        metrics.bytes_client_to_target,
+        metrics.bytes_target_to_client
+    );
 }
 
 static void update_relay_interests(fd_selector selector, client_state_t *state) {
@@ -577,6 +602,11 @@ static void target_write(struct selector_key *key) {
             connected ? SOCKS5_REPLY_SUCCESS :
                         socks5_reply_for_errno(state->last_connect_error)
         );
+        if (connected) {
+            metrics_connection_succeeded();
+        } else {
+            metrics_connection_failed();
+        }
         state->stage = connected ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
         selector_set_interest(key->s, state->client_fd, OP_WRITE);
         return;
@@ -710,6 +740,7 @@ static void begin_request_connection(struct selector_key *key,
 
         if (!resolution_started) {
             prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
+            metrics_connection_failed();
             state->stage = CLIENT_STAGE_CLOSING;
             selector_set_interest_key(key, OP_WRITE);
             return;
@@ -733,6 +764,7 @@ static void begin_request_connection(struct selector_key *key,
             state,
             socks5_reply_for_errno(state->last_connect_error)
         );
+        metrics_connection_failed();
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -861,6 +893,7 @@ static void client_read(struct selector_key *key) {
                 }
 
                 prepare_request_response(state, request_reply);
+                metrics_connection_failed();
                 state->stage = CLIENT_STAGE_CLOSING;
                 state->read_len = 0;
                 selector_set_interest_key(key, OP_WRITE);
@@ -875,6 +908,7 @@ static void client_read(struct selector_key *key) {
                     &request
                 )) {
                 prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
+                metrics_connection_failed();
                 state->stage = CLIENT_STAGE_CLOSING;
                 state->read_len = 0;
                 selector_set_interest_key(key, OP_WRITE);
@@ -935,6 +969,7 @@ static void client_block(struct selector_key *key) {
             state,
             socks5_reply_for_gai_error(status)
         );
+        metrics_connection_failed();
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -948,6 +983,7 @@ static void client_block(struct selector_key *key) {
             state,
             socks5_reply_for_errno(state->last_connect_error)
         );
+        metrics_connection_failed();
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -961,6 +997,146 @@ static const fd_handler client_handler = {
     .handle_write = client_write,
     .handle_block = client_block,
     .handle_close = client_close,
+};
+
+static void management_prepare_response(management_state_t *state) {
+    state->read_buffer[state->read_len] = '\0';
+    state->read_buffer[strcspn(state->read_buffer, "\r\n")] = '\0';
+
+    if (strcasecmp(state->read_buffer, "METRICS") == 0) {
+        format_metrics_response(state->write_buffer, sizeof(state->write_buffer));
+    } else if (strcasecmp(state->read_buffer, "HELP") == 0) {
+        snprintf(state->write_buffer, sizeof(state->write_buffer), "commands=METRICS,HELP\n");
+    } else {
+        snprintf(state->write_buffer, sizeof(state->write_buffer), "error=unknown_command\n");
+    }
+
+    state->write_len = strlen(state->write_buffer);
+    state->write_off = 0;
+}
+
+static void management_close(struct selector_key *key) {
+    management_state_t *state = key->data;
+
+    free(state);
+    close(key->fd);
+}
+
+static void management_write(struct selector_key *key) {
+    management_state_t *state = key->data;
+
+    while (state->write_off < state->write_len) {
+        ssize_t sent = send(
+            key->fd,
+            state->write_buffer + state->write_off,
+            state->write_len - state->write_off,
+            MSG_NOSIGNAL
+        );
+
+        if (sent > 0) {
+            state->write_off += (size_t) sent;
+            continue;
+        }
+
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return;
+        }
+
+        selector_unregister_fd(key->s, key->fd);
+        return;
+    }
+
+    selector_unregister_fd(key->s, key->fd);
+}
+
+static void management_read(struct selector_key *key) {
+    management_state_t *state = key->data;
+
+    ssize_t received = recv(
+        key->fd,
+        state->read_buffer + state->read_len,
+        sizeof(state->read_buffer) - state->read_len - 1,
+        0
+    );
+
+    if (received > 0) {
+        state->read_len += (size_t) received;
+
+        if (memchr(state->read_buffer, '\n', state->read_len) != NULL ||
+            state->read_len == sizeof(state->read_buffer) - 1) {
+            management_prepare_response(state);
+            selector_set_interest_key(key, OP_WRITE);
+        }
+        return;
+    }
+
+    if (received == 0) {
+        selector_unregister_fd(key->s, key->fd);
+        return;
+    }
+
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return;
+    }
+
+    selector_unregister_fd(key->s, key->fd);
+}
+
+static const fd_handler management_client_handler = {
+    .handle_read = management_read,
+    .handle_write = management_write,
+    .handle_close = management_close,
+};
+
+static void accept_management_connection(struct selector_key *key) {
+    while (true) {
+        struct sockaddr_storage client_addr;
+        socklen_t client_addr_len = sizeof(client_addr);
+
+        int client_fd = accept(
+            key->fd,
+            (struct sockaddr *) &client_addr,
+            &client_addr_len
+        );
+
+        if (client_fd == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+
+            perror("accept management");
+            return;
+        }
+
+        if (set_nonblocking(client_fd) == -1) {
+            close(client_fd);
+            continue;
+        }
+
+        management_state_t *state = calloc(1, sizeof(*state));
+
+        if (state == NULL) {
+            close(client_fd);
+            continue;
+        }
+
+        selector_status status = selector_register(
+            key->s,
+            client_fd,
+            &management_client_handler,
+            OP_READ,
+            state
+        );
+
+        if (status != SELECTOR_SUCCESS) {
+            free(state);
+            close(client_fd);
+        }
+    }
+}
+
+static const fd_handler management_accept_handler = {
+    .handle_read = accept_management_connection,
 };
 
 static void accept_connection(struct selector_key *key) {
@@ -1020,7 +1196,10 @@ static const fd_handler accept_handler = {
     .handle_read = accept_connection,
 };
 
-int server_run(const char *host, const char *port) {
+int server_run(const char *host,
+               const char *port,
+               const char *management_host,
+               const char *management_port) {
     signal(SIGTERM, sigterm_handler);
     signal(SIGINT, sigterm_handler);
 
@@ -1028,10 +1207,22 @@ int server_run(const char *host, const char *port) {
         port = "1080";
     }
 
+    if (management_port == NULL) {
+        management_port = "8080";
+    }
+
     int server_fd = create_passive_socket(host, port);
 
     if (server_fd == -1) {
         fprintf(stderr, "could not create passive socket\n");
+        return 1;
+    }
+
+    int management_fd = create_passive_socket(management_host, management_port);
+
+    if (management_fd == -1) {
+        close(server_fd);
+        fprintf(stderr, "could not create management socket\n");
         return 1;
     }
 
@@ -1044,6 +1235,7 @@ int server_run(const char *host, const char *port) {
     };
 
     if (selector_init(&conf) != SELECTOR_SUCCESS) {
+        close(management_fd);
         close(server_fd);
         fprintf(stderr, "selector_init failed\n");
         return 1;
@@ -1053,6 +1245,7 @@ int server_run(const char *host, const char *port) {
 
     if (selector == NULL) {
         selector_close();
+        close(management_fd);
         close(server_fd);
         fprintf(stderr, "selector_new failed\n");
         return 1;
@@ -1069,19 +1262,45 @@ int server_run(const char *host, const char *port) {
     if (status != SELECTOR_SUCCESS) {
         selector_destroy(selector);
         selector_close();
+        close(management_fd);
         close(server_fd);
         fprintf(stderr, "could not register server socket\n");
         return 1;
     }
 
-    printf("SOCKS5 skeleton listening on port %s\n", port);
+    status = selector_register(
+        selector,
+        management_fd,
+        &management_accept_handler,
+        OP_READ,
+        NULL
+    );
+
+    if (status != SELECTOR_SUCCESS) {
+        selector_unregister_fd(selector, server_fd);
+        selector_destroy(selector);
+        selector_close();
+        close(management_fd);
+        close(server_fd);
+        fprintf(stderr, "could not register management socket\n");
+        return 1;
+    }
+
+    printf("SOCKS5 listening on %s:%s\n", host == NULL ? "0.0.0.0" : host, port);
+    printf(
+        "Management listening on %s:%s\n",
+        management_host == NULL ? "0.0.0.0" : management_host,
+        management_port
+    );
 
     while (!done) {
         selector_select(selector);
     }
 
     selector_unregister_fd(selector, server_fd);
+    selector_unregister_fd(selector, management_fd);
     close(server_fd);
+    close(management_fd);
 
     selector_destroy(selector);
 
@@ -1090,11 +1309,15 @@ int server_run(const char *host, const char *port) {
     printf(
         "Metrics: historical_connections=%" PRIu64
         " concurrent_connections=%" PRIu64
+        " successful_connections=%" PRIu64
+        " failed_connections=%" PRIu64
         " bytes_transferred=%" PRIu64
         " bytes_client_to_target=%" PRIu64
         " bytes_target_to_client=%" PRIu64 "\n",
         metrics.historical_connections,
         metrics.concurrent_connections,
+        metrics.successful_connections,
+        metrics.failed_connections,
         metrics_total_transferred_bytes(&metrics),
         metrics.bytes_client_to_target,
         metrics.bytes_target_to_client
@@ -1110,6 +1333,7 @@ int server_run(const char *host, const char *port) {
 int main(int argc, char *argv[]) {
     struct socks5args args;
     char port[6];
+    char management_port[6];
     size_t users_count = 0;
 
     parse_args(argc, argv, &args);
@@ -1122,6 +1346,7 @@ int main(int argc, char *argv[]) {
     configured_users_count = users_count;
 
     snprintf(port, sizeof(port), "%hu", args.socks_port);
+    snprintf(management_port, sizeof(management_port), "%hu", args.mng_port);
 
-    return server_run(args.socks_addr, port);
+    return server_run(args.socks_addr, port, args.mng_addr, management_port);
 }
