@@ -110,10 +110,38 @@ static bool print_response(int fd) {
     }
 }
 
+static bool build_command(int argc, char *argv[], int start, char *buffer, size_t buffer_size) {
+    size_t used = 0;
+
+    if (start >= argc) {
+        snprintf(buffer, buffer_size, "STATS");
+        return true;
+    }
+
+    for (int i = start; i < argc; i++) {
+        int written = snprintf(
+            buffer + used,
+            buffer_size - used,
+            "%s%s",
+            i == start ? "" : " ",
+            argv[i]
+        );
+
+        if (written < 0 || (size_t) written >= buffer_size - used) {
+            fprintf(stderr, "command too long\n");
+            return false;
+        }
+
+        used += (size_t) written;
+    }
+
+    return true;
+}
+
 int main(int argc, char *argv[]) {
     const char *host = "127.0.0.1";
     const char *port = "8080";
-    const char *command = "STATS";
+    char command[CLIENT_BUFFER_SIZE];
     int option;
 
     while ((option = getopt(argc, argv, "hL:P:")) != -1) {
@@ -133,12 +161,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (optind < argc) {
-        command = argv[optind++];
-    }
-
-    if (optind < argc) {
-        usage(argv[0]);
+    if (!build_command(argc, argv, optind, command, sizeof(command))) {
         return 1;
     }
 

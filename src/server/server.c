@@ -1,6 +1,7 @@
 #include "include/server.h"
 #include "include/socks5.h"
 #include "include/metrics.h"
+#include "include/users.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -22,8 +23,6 @@
 #include "../utils/include/args.h"
 
 static volatile sig_atomic_t done = 0;
-static struct users *configured_users = NULL;
-static size_t configured_users_count = 0;
 
 struct resolver_job {
     fd_selector selector;
@@ -351,26 +350,14 @@ static void prepare_auth_response(client_state_t *state, uint8_t status) {
 }
 
 static bool requires_authentication(void) {
-    return configured_users_count > 0;
+    return users_are_configured();
 }
 
 static bool credentials_are_valid(const uint8_t *username,
                                   uint8_t username_len,
                                   const uint8_t *password,
                                   uint8_t password_len) {
-    for (size_t i = 0; i < configured_users_count; i++) {
-        const char *name = configured_users[i].name;
-        const char *pass = configured_users[i].pass;
-
-        if (strlen(name) == username_len &&
-            strlen(pass) == password_len &&
-            memcmp(name, username, username_len) == 0 &&
-            memcmp(pass, password, password_len) == 0) {
-            return true;
-        }
-    }
-
-    return false;
+    return users_credentials_are_valid(username, username_len, password, password_len);
 }
 
 static bool parse_auth_request(client_state_t *state, bool *authenticated) {
@@ -1000,19 +987,61 @@ static const fd_handler client_handler = {
 };
 
 static void management_prepare_response(management_state_t *state) {
+    char *command;
+    char *arg1;
+    char *arg2;
+
     state->read_buffer[state->read_len] = '\0';
     state->read_buffer[strcspn(state->read_buffer, "\r\n")] = '\0';
 
-    if (strcasecmp(state->read_buffer, "STATS") == 0 ||
-        strcasecmp(state->read_buffer, "METRICS") == 0) {
+    command = strtok(state->read_buffer, " \t");
+    arg1 = strtok(NULL, " \t");
+    arg2 = strtok(NULL, " \t");
+
+    if (command == NULL) {
+        snprintf(state->write_buffer, sizeof(state->write_buffer), "error=empty_command\n");
+    } else if (strcasecmp(command, "STATS") == 0 ||
+               strcasecmp(command, "METRICS") == 0) {
         format_metrics_response(state->write_buffer, sizeof(state->write_buffer));
-    } else if (strcasecmp(state->read_buffer, "QUIT") == 0) {
+    } else if (strcasecmp(command, "USERS") == 0) {
+        users_format_list(state->write_buffer, sizeof(state->write_buffer));
+    } else if (strcasecmp(command, "ADDUSER") == 0) {
+        users_result_t result;
+
+        if (arg1 == NULL || arg2 == NULL || strtok(NULL, " \t") != NULL) {
+            snprintf(state->write_buffer, sizeof(state->write_buffer), "error=usage_ADDUSER_user_pass\n");
+        } else {
+            result = users_add(arg1, arg2);
+            snprintf(
+                state->write_buffer,
+                sizeof(state->write_buffer),
+                "adduser=%s\nusers_count=%zu\n",
+                users_result_name(result),
+                users_count()
+            );
+        }
+    } else if (strcasecmp(command, "DELUSER") == 0) {
+        users_result_t result;
+
+        if (arg1 == NULL || arg2 != NULL) {
+            snprintf(state->write_buffer, sizeof(state->write_buffer), "error=usage_DELUSER_user\n");
+        } else {
+            result = users_remove(arg1);
+            snprintf(
+                state->write_buffer,
+                sizeof(state->write_buffer),
+                "deluser=%s\nusers_count=%zu\n",
+                users_result_name(result),
+                users_count()
+            );
+        }
+    } else if (strcasecmp(command, "QUIT") == 0) {
         snprintf(state->write_buffer, sizeof(state->write_buffer), "ok=bye\n");
-    } else if (strcasecmp(state->read_buffer, "HELP") == 0) {
+    } else if (strcasecmp(command, "HELP") == 0) {
         snprintf(
             state->write_buffer,
             sizeof(state->write_buffer),
-            "commands=STATS,METRICS,HELP,QUIT\n"
+            "commands=STATS,METRICS,USERS,ADDUSER,DELUSER,HELP,QUIT\n"
         );
     } else {
         snprintf(state->write_buffer, sizeof(state->write_buffer), "error=unknown_command\n");
@@ -1349,8 +1378,7 @@ int main(int argc, char *argv[]) {
         users_count++;
     }
 
-    configured_users = args.users;
-    configured_users_count = users_count;
+    users_init_from_args(args.users, users_count);
 
     snprintf(port, sizeof(port), "%hu", args.socks_port);
     snprintf(management_port, sizeof(management_port), "%hu", args.mng_port);
