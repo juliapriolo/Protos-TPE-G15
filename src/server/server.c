@@ -2,7 +2,9 @@
 #include "include/socks5.h"
 #include "include/metrics.h"
 #include "include/users.h"
+#include "include/access_log.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -392,7 +394,68 @@ static bool parse_auth_request(client_state_t *state, bool *authenticated) {
         password_len
     );
 
+    if (*authenticated) {
+        memcpy(state->username, state->read_buffer + 2, username_len);
+        state->username[username_len] = '\0';
+    }
+
     return true;
+}
+
+static void remember_request_destination(client_state_t *state,
+                                         const socks5_request_t *request) {
+    state->destination_port = request->port;
+    state->access_logged = false;
+
+    if (request->atyp == SOCKS5_ATYP_DOMAIN) {
+        snprintf(
+            state->destination_host,
+            sizeof(state->destination_host),
+            "%s",
+            request->host
+        );
+        return;
+    }
+
+    if (request->atyp == SOCKS5_ATYP_IPV4) {
+        const struct sockaddr_in *addr = (const struct sockaddr_in *) &request->addr;
+        if (inet_ntop(
+                AF_INET,
+                &addr->sin_addr,
+                state->destination_host,
+                sizeof(state->destination_host)
+            ) != NULL) {
+            return;
+        }
+    }
+
+    if (request->atyp == SOCKS5_ATYP_IPV6) {
+        const struct sockaddr_in6 *addr = (const struct sockaddr_in6 *) &request->addr;
+        if (inet_ntop(
+                AF_INET6,
+                &addr->sin6_addr,
+                state->destination_host,
+                sizeof(state->destination_host)
+            ) != NULL) {
+            return;
+        }
+    }
+
+    snprintf(state->destination_host, sizeof(state->destination_host), "unknown");
+}
+
+static void access_log_client_connection(client_state_t *state, bool success) {
+    if (state->access_logged || state->destination_host[0] == '\0') {
+        return;
+    }
+
+    access_log_connection(
+        state->username,
+        state->destination_host,
+        state->destination_port,
+        success
+    );
+    state->access_logged = true;
 }
 
 static uint8_t socks5_reply_for_errno(int error) {
@@ -594,6 +657,7 @@ static void target_write(struct selector_key *key) {
         } else {
             metrics_connection_failed();
         }
+        access_log_client_connection(state, connected);
         state->stage = connected ? CLIENT_STAGE_RELAY : CLIENT_STAGE_CLOSING;
         selector_set_interest(key->s, state->client_fd, OP_WRITE);
         return;
@@ -714,6 +778,7 @@ static void begin_request_connection(struct selector_key *key,
                                      const socks5_request_t *request) {
     free_target_addresses(state);
     state->last_connect_error = 0;
+    remember_request_destination(state, request);
 
     if (request->atyp == SOCKS5_ATYP_DOMAIN) {
         detach_resolver_job(state);
@@ -728,6 +793,7 @@ static void begin_request_connection(struct selector_key *key,
         if (!resolution_started) {
             prepare_request_response(state, SOCKS5_REPLY_GENERAL_FAILURE);
             metrics_connection_failed();
+            access_log_client_connection(state, false);
             state->stage = CLIENT_STAGE_CLOSING;
             selector_set_interest_key(key, OP_WRITE);
             return;
@@ -752,6 +818,7 @@ static void begin_request_connection(struct selector_key *key,
             socks5_reply_for_errno(state->last_connect_error)
         );
         metrics_connection_failed();
+        access_log_client_connection(state, false);
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -957,6 +1024,7 @@ static void client_block(struct selector_key *key) {
             socks5_reply_for_gai_error(status)
         );
         metrics_connection_failed();
+        access_log_client_connection(state, false);
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -971,6 +1039,7 @@ static void client_block(struct selector_key *key) {
             socks5_reply_for_errno(state->last_connect_error)
         );
         metrics_connection_failed();
+        access_log_client_connection(state, false);
         state->stage = CLIENT_STAGE_CLOSING;
         selector_set_interest_key(key, OP_WRITE);
         return;
@@ -1210,6 +1279,7 @@ static void accept_connection(struct selector_key *key) {
         state->stage = CLIENT_STAGE_GREETING;
         state->client_fd = client_fd;
         state->target_fd = -1;
+        snprintf(state->username, sizeof(state->username), "anonymous");
 
         selector_status status = selector_register(
             key->s,

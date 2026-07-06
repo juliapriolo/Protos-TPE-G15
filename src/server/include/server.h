@@ -11,6 +11,8 @@
 #define SERVER_BACKLOG 128
 #define SERVER_BUFFER_SIZE 4096
 #define MANAGEMENT_BUFFER_SIZE 1024
+#define CLIENT_USERNAME_MAX 255
+#define CLIENT_DESTINATION_MAX 255
 
 struct resolver_job;
 
@@ -46,6 +48,10 @@ typedef struct client_state {
     struct addrinfo *target_address_current;
     struct resolver_job *resolver_job;
     int last_connect_error;
+    char username[CLIENT_USERNAME_MAX + 1];
+    char destination_host[CLIENT_DESTINATION_MAX + 1];
+    uint16_t destination_port;
+    bool access_logged;
 
     client_stage_t stage;
     bool relay_started;
