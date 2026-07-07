@@ -24,7 +24,9 @@
 #include "../utils/include/selector.h"
 #include "../utils/include/args.h"
 
-static volatile sig_atomic_t done = 0;
+static volatile sig_atomic_t shutdown_requested = 0;
+static volatile sig_atomic_t force_shutdown = 0;
+static size_t active_client_connections = 0;
 
 struct resolver_job {
     fd_selector selector;
@@ -44,7 +46,12 @@ static void format_metrics_response(char *buffer, size_t buffer_size);
 
 static void sigterm_handler(const int signal) {
     (void) signal;
-    done = 1;
+
+    if (shutdown_requested) {
+        force_shutdown = 1;
+    } else {
+        shutdown_requested = 1;
+    }
 }
 
 static int set_nonblocking(const int fd) {
@@ -243,6 +250,7 @@ static void client_close(struct selector_key *key) {
         detach_resolver_job(state);
         free_target_addresses(state);
         metrics_connection_closed();
+        active_client_connections--;
         free(state);
     }
 
@@ -1294,6 +1302,7 @@ static void accept_connection(struct selector_key *key) {
             close(client_fd);
         } else {
             metrics_connection_opened();
+            active_client_connections++;
         }
     }
 }
@@ -1399,14 +1408,42 @@ int server_run(const char *host,
         management_port
     );
 
-    while (!done) {
+    bool stopped_accepting = false;
+
+    while (!force_shutdown) {
         selector_select(selector);
+
+        if (shutdown_requested && !stopped_accepting) {
+            stopped_accepting = true;
+            selector_unregister_fd(selector, server_fd);
+            selector_unregister_fd(selector, management_fd);
+            close(server_fd);
+            close(management_fd);
+            printf(
+                "shutdown requested: no longer accepting new connections, "
+                "waiting for %zu active connection(s)\n",
+                active_client_connections
+            );
+        }
+
+        if (stopped_accepting && active_client_connections == 0) {
+            break;
+        }
     }
 
-    selector_unregister_fd(selector, server_fd);
-    selector_unregister_fd(selector, management_fd);
-    close(server_fd);
-    close(management_fd);
+    if (!stopped_accepting) {
+        selector_unregister_fd(selector, server_fd);
+        selector_unregister_fd(selector, management_fd);
+        close(server_fd);
+        close(management_fd);
+    }
+
+    if (force_shutdown && active_client_connections > 0) {
+        printf(
+            "forced shutdown: dropping %zu active connection(s)\n",
+            active_client_connections
+        );
+    }
 
     selector_destroy(selector);
 
