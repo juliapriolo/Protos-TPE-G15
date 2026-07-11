@@ -14,7 +14,7 @@
 static void usage(const char *program) {
     fprintf(
         stderr,
-        "Usage: %s [-L management_addr] [-P management_port] [STATS|METRICS|HELP|QUIT]\n",
+        "Usage: %s [-L management_addr] [-P management_port] [STATS|METRICS|USERS|ADDUSER user pass|DELUSER user|HELP|QUIT]\n",
         program
     );
 }
