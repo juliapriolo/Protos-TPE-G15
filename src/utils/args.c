@@ -46,8 +46,7 @@ static void
 version(void)
 {
     fprintf(stderr, "socks5v version 0.0\n"
-            "ITBA Protocolos de Comunicación 2025/1 -- Grupo X\n"
-            "AQUI VA LA LICENCIA\n");
+            "ITBA Protocolos de Comunicación 2026/1 -- Grupo 15\n");
 }
 
 static void
@@ -60,9 +59,9 @@ usage(const char* progname)
             "   -l <SOCKS addr>  Dirección donde servirá el proxy SOCKS.\n"
             "   -L <conf  addr>  Dirección donde servirá el servicio de management.\n"
             "   -p <SOCKS port>  Puerto entrante conexiones SOCKS.\n"
-            "   -P <conf port>   Puerto entrante conexiones configuracion\n"
+            "   -P <conf port>   Puerto entrante conexiones configuracion.\n"
             "   -u <name>:<pass> Usuario y contraseña de usuario que puede usar el proxy. Hasta 10.\n"
-            "   -v               Imprime información sobre la versión versión y termina.\n"
+            "   -v               Imprime información sobre la versión y termina.\n"
 
             "\n",
             progname);
@@ -80,19 +79,17 @@ parse_args(const int argc, char** argv, struct socks5args* args)
     args->mng_addr = "127.0.0.1";
     args->mng_port = 8080;
 
-    args->disectors_enabled = true;
-
     int c;
     int nusers = 0;
 
-    while (true)
+    while (1)
     {
         int option_index = 0;
         static struct option long_options[] = {
             {0, 0, 0, 0}
         };
 
-        c = getopt_long(argc, argv, "hl:L:Np:P:u:v", long_options, &option_index);
+        c = getopt_long(argc, argv, "hl:L:p:P:u:v", long_options, &option_index);
         if (c == -1)
             break;
 
@@ -106,9 +103,6 @@ parse_args(const int argc, char** argv, struct socks5args* args)
             break;
         case 'L':
             args->mng_addr = optarg;
-            break;
-        case 'N':
-            args->disectors_enabled = false;
             break;
         case 'p':
             args->socks_port = port(optarg);
