@@ -603,6 +603,15 @@ static void target_read(struct selector_key *key) {
         state->t2c_len = (size_t) received;
         state->t2c_off = 0;
         update_relay_interests(key->s, state);
+
+        if (state->client_fd != -1) {
+            struct selector_key client_key = {
+                .s = key->s,
+                .fd = state->client_fd,
+                .data = state,
+            };
+            client_write(&client_key);
+        }
         return;
     }
 
@@ -855,6 +864,15 @@ static void client_read(struct selector_key *key) {
             state->c2t_len = (size_t) received;
             state->c2t_off = 0;
             update_relay_interests(key->s, state);
+
+            if (state->target_fd != -1) {
+                struct selector_key target_key = {
+                    .s = key->s,
+                    .fd = state->target_fd,
+                    .data = state,
+                };
+                target_write(&target_key);
+            }
             return;
         }
 
@@ -906,7 +924,7 @@ static void client_read(struct selector_key *key) {
                 nmethods
             );
 
-            if (requires_authentication() && accepts_username_password) {
+            if (accepts_username_password) {
                 prepare_greeting_response(state, SOCKS5_METHOD_USERNAME_PASSWORD);
                 state->stage = CLIENT_STAGE_AUTH;
             } else if (!requires_authentication() && accepts_no_auth) {
