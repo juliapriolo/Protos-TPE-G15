@@ -309,3 +309,50 @@ Salida esperada:
 shutdown requested: no longer accepting new connections, waiting for 0 active connection(s)
 Metrics: historical_connections=...
 ```
+
+
+## Prueba de estres
+
+Se incluyen dos scripts en la raiz del repositorio, sin dependencias externas
+(solo libreria estandar de Python 3.8+), para medir la cantidad maxima de
+conexiones SOCKS5 concurrentes que soporta el servidor y como se degrada el
+throughput bajo carga:
+
+- `stress_echo_server.py`: servidor TCP de eco que actua como destino remoto
+  de las conexiones `CONNECT` durante la prueba (no forma parte del proxy).
+- `stress_test.py`: abre N conexiones SOCKS5 concurrentes (metodo `NO AUTH`),
+  completa el handshake y el `CONNECT` contra el servidor de eco, intercambia
+  datos y reporta exitos, fallos, throughput agregado y latencia de conexion,
+  repitiendo para niveles crecientes de `N` (parametro `--levels`).
+
+Uso basico:
+
+```bash
+# 1) destino de eco
+python3 stress_echo_server.py --host 127.0.0.1 --port 9099 &
+
+# 2) servidor bajo prueba
+./bin/server -l 127.0.0.1 -p 1090 -L 127.0.0.1 -P 8090 &
+
+# 3) prueba de carga
+python3 stress_test.py --socks-port 1090 --target-port 9099 \
+    --levels 100,250,500,600,750,1000
+```
+
+Por defecto, todas las conexiones se abren casi al mismo tiempo, lo que
+tambien ejercita el backlog de `listen()` (`SERVER_BACKLOG = 128`) y no solo
+la capacidad de conexiones concurrentes sostenidas. Para aislar el limite
+real de concurrencia (escalonando los intentos de conexion y manteniendolas
+abiertas simultaneamente antes de transferir datos), usar `--stagger` y
+`--hold`:
+
+```bash
+python3 stress_test.py --socks-port 1090 --target-port 9099 \
+    --levels 400,500,600,700,850,1000,1200,1500 \
+    --payload 4096 --rounds 3 --timeout 25 --stagger 0.002 --hold 3
+```
+
+Correr `python3 stress_test.py --help` para ver todas las opciones
+disponibles (payload, rondas de eco por conexion, timeout, host/puerto del
+destino y del proxy, etc). Los resultados obtenidos y su analisis estan
+documentados en el informe, seccion "Ejemplos de prueba".
