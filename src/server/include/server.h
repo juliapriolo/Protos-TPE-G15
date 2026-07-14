@@ -10,7 +10,6 @@
 #define SERVER_DEFAULT_PORT 1080
 #define SERVER_BACKLOG 128
 #define SERVER_BUFFER_SIZE 4096
-#define MANAGEMENT_BUFFER_SIZE 1024
 #define CLIENT_USERNAME_MAX 255
 #define CLIENT_DESTINATION_MAX 255
 
@@ -57,13 +56,7 @@ typedef struct client_state {
     bool relay_started;
 } client_state_t;
 
-typedef struct management_state {
-    char read_buffer[MANAGEMENT_BUFFER_SIZE];
-    char write_buffer[MANAGEMENT_BUFFER_SIZE];
-    size_t read_len;
-    size_t write_len;
-    size_t write_off;
-} management_state_t;
+int set_nonblocking(int fd);
 
 int server_run(const char *host,
                const char *port,
